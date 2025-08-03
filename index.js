@@ -17,6 +17,12 @@ const {
   ERROR_MESSAGES,
   SUCCESS_MESSAGES 
 } = require('./constants');
+const { 
+  generateId, 
+  generateFlowToken, 
+  truncateText, 
+  getFileExtensionFromMimeType 
+} = require('./utils');
 
 // Log configuration status on startup
 logConfigStatus();
@@ -55,6 +61,12 @@ const openai = new OpenAIApi(openAiConfig);
 console.log("[INFO] OpenAI createChatCompletion configured.");
 
 // ----------------------------------------------------------------------
+// Simple caching for knowledge queries
+// ----------------------------------------------------------------------
+const { createSimpleCache } = require('./utils');
+const knowledgeCache = createSimpleCache(10 * 60 * 1000); // 10 minutes TTL
+
+// ----------------------------------------------------------------------
 // 3) Knowledge base from external link
 // ----------------------------------------------------------------------
 let knowledgeText = "No knowledgebase loaded.";
@@ -71,27 +83,6 @@ let knowledgeText = "No knowledgebase loaded.";
     knowledgeText = "Error fetching knowledge data.";
   }
 })();
-
-// ----------------------------------------------------------------------
-// Utility: random ID, random flow token
-// ----------------------------------------------------------------------
-function generateId(length = MESSAGE_CONFIG.ID_LENGTH) {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
-
-function generateFlowToken(length = MESSAGE_CONFIG.FLOW_TOKEN_LENGTH) {
-  const digits = "0123456789";
-  let r = "";
-  for (let i = 0; i < length; i++) {
-    r += digits.charAt(Math.floor(Math.random() * digits.length));
-  }
-  return r;
-}
 
 // ----------------------------------------------------------------------
 // Tools definition
@@ -233,12 +224,9 @@ async function getOrCreatePoCByPhone(phone, contactName) {
 }
 
 async function saveChatToPoC(pocRef, direction, from, to, msgType, msgBody, extraFields = {}) {
-  let truncated = msgBody || "";
-  if (truncated.length > MESSAGE_CONFIG.TRUNCATED_MESSAGE_LENGTH) {
-    truncated = truncated.slice(0, MESSAGE_CONFIG.TRUNCATED_MESSAGE_LENGTH) + "...(truncated)";
-  }
+  const truncated = truncateText(msgBody || "");
 
-  let data = {
+  const data = {
     Direction: direction,
     From: from,
     To: to,
@@ -247,10 +235,22 @@ async function saveChatToPoC(pocRef, direction, from, to, msgType, msgBody, extr
     Timestamp: admin.firestore.FieldValue.serverTimestamp(),
     ...extraFields,
   };
-  await pocRef.collection(COLLECTIONS.CHAT).add(data);
-  console.log(
-    `[INFO] Chat => direction=${direction}, from=${from}, to=${to}, msgType=${msgType}`
+  
+  const result = await safeDbOperation(
+    () => pocRef.collection(COLLECTIONS.CHAT).add(data),
+    'saveChatToPoC'
   );
+  
+  if (result) {
+    metrics.recordDbOperation();
+    console.log(
+      `[INFO] Chat saved => direction=${direction}, from=${from}, to=${to}, msgType=${msgType}`
+    );
+  } else {
+    metrics.recordDbError();
+  }
+  
+  return result;
 }
 
 // ----------------------------------------------------------------------
@@ -285,16 +285,7 @@ async function downloadWhatsAppMediaAndUpload(mediaId, mimeType = "application/o
     let arrayBuf = await fileResp.arrayBuffer();
     let fileBuffer = Buffer.from(arrayBuf);
 
-    let ext = "dat";
-    if (mimeType.includes("image")) {
-      ext = mimeType.split("/")[1];
-    } else if (mimeType.includes("pdf")) {
-      ext = "pdf";
-    } else if (mimeType.includes("audio")) {
-      ext = "audio";
-    } else if (mimeType.includes("video")) {
-      ext = "video";
-    }
+    const ext = getFileExtensionFromMimeType(mimeType);
     let fileName = `${mediaId}.${ext}`;
     let fileRef = bucket.file(fileName);
     await fileRef.save(fileBuffer, { contentType: mimeType, resumable: false });
@@ -633,6 +624,19 @@ If there's truly nothing relevant, respond with an empty line or say "No relevan
 // ----------------------------------------------------------------------
 async function knowledgeLookupImpl(userQuery) {
   console.log(`[INFO] knowledgeLookupImpl => q="${userQuery}"`);
+  
+  // Check cache first
+  const cacheKey = `knowledge:${userQuery.toLowerCase().trim()}`;
+  const cached = knowledgeCache.get(cacheKey);
+  if (cached) {
+    console.log(`[INFO] Cache hit for query: ${userQuery}`);
+    metrics.recordCacheHit();
+    return cached;
+  }
+  
+  // Record cache miss
+  metrics.recordCacheMiss();
+  
   if (!knowledgeText || knowledgeText.startsWith("Error fetching")) {
     return "No knowledgebase loaded. Sorry.";
   }
@@ -650,17 +654,24 @@ async function knowledgeLookupImpl(userQuery) {
   //    Or feed them to GPT for a refined summary
   if (matchingLines.length > 0) {
     // Summarize them via GPT for a more natural reply
-    return await refineKnowledgeWithGpt(userQuery, matchingLines);
+    const result = await refineKnowledgeWithGpt(userQuery, matchingLines);
+    // Cache the result
+    knowledgeCache.set(cacheKey, result);
+    return result;
   }
 
   // 5) If zero lines => do a GPT pass over the entire knowledge base text
   let fallbackReply = await checkKnowledgeFullWithGpt(userQuery, knowledgeText);
   if (fallbackReply && fallbackReply.trim().length > 0) {
+    // Cache the fallback result too
+    knowledgeCache.set(cacheKey, fallbackReply);
     return fallbackReply; // use GPT's final answer
   }
 
   // 6) If GPT also found nothing
-  return "No direct info found in the knowledge base. Please ask more about Test hospital!";
+  const noResultMessage = "No direct info found in the knowledge base. Please ask more about Test hospital!";
+  knowledgeCache.set(cacheKey, noResultMessage);
+  return noResultMessage;
 }
 
 /**
@@ -994,18 +1005,32 @@ async function handleOpenAiFunctionCall(fCall, fromPhone, userId, userQuery) {
 // ----------------------------------------------------------------------
 async function sendWhatsAppMessage(to, message) {
   console.log(`[INFO] sendWhatsAppMessage => to=${to}, msg="${message}"`);
+  
+  // Validate inputs
+  if (!to || !message) {
+    logError(new Error('Missing required parameters'), 'sendWhatsAppMessage', { to, message });
+    return false;
+  }
+  
   const token = CONFIG.WHATSAPP_TOKEN;
   const phoneId = CONFIG.WHATSAPP_PHONE_ID;
+  
+  if (!token || !phoneId) {
+    logError(new Error('Missing WhatsApp configuration'), 'sendWhatsAppMessage');
+    return false;
+  }
+  
   const url = `${API_CONFIG.WHATSAPP_BASE_URL}/${API_CONFIG.WHATSAPP_API_VERSION}/${phoneId}/messages`;
 
-  let payload = {
+  const payload = {
     messaging_product: "whatsapp",
     to,
-    type: "text",
+    type: MESSAGE_TYPES.TEXT,
     text: { body: message },
   };
-  try {
-    let resp = await fetchFn(url, {
+  
+  const result = await safeApiCall(async () => {
+    const resp = await fetchFn(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1013,12 +1038,23 @@ async function sendWhatsAppMessage(to, message) {
       },
       body: JSON.stringify(payload),
     });
-    console.log(`[INFO] sendWhatsAppMessage => status=${resp.status}`);
-    let txt = await resp.text();
-    console.log(`[INFO] sendWhatsAppMessage => body=${txt}`);
-  } catch (e) {
-    console.error("[ERROR] => sendWhatsAppMessage:", e);
+    
+    if (!resp.ok) {
+      throw new Error(`WhatsApp API error: ${resp.status} ${resp.statusText}`);
+    }
+    
+    const responseData = await resp.json();
+    console.log(`[INFO] sendWhatsAppMessage => status=${resp.status}`, responseData);
+    return responseData;
+  }, 'sendWhatsAppMessage');
+  
+  if (result !== null) {
+    metrics.recordMessageSent();
+  } else {
+    metrics.recordSendError();
   }
+  
+  return result !== null;
 }
 
 // ----------------------------------------------------------------------
@@ -1036,6 +1072,10 @@ Respond in a natural, friendly, and helpful manner.
 `,
 };
 
+// Import error handling utilities
+const { safeApiCall, safeDbOperation, logError } = require('./errorHandler');
+const { metrics, metricsMiddleware, startMetricsLogging } = require('./monitoring');
+
 // Import middleware
 const { validateWebhookRequest, sanitizeRequest } = require('./validation');
 const { errorHandler, asyncHandler } = require('./errorHandler');
@@ -1047,6 +1087,7 @@ const { generalRateLimit, webhookRateLimit } = require('./rateLimit');
 const app = express();
 
 // Apply middleware in order
+app.use(metricsMiddleware); // Track requests and responses
 app.use(express.json({ limit: '10mb' })); // Increase limit for media messages
 app.use(sanitizeRequest); // Sanitize inputs
 app.use(generalRateLimit); // Apply general rate limiting
@@ -1074,7 +1115,12 @@ app.post("/webhook", webhookRateLimit, validateWebhookRequest, asyncHandler(asyn
   const entry = (req.body.entry && req.body.entry[0]) || {};
   const changes = (entry.changes && entry.changes[0]) || {};
   const value = changes.value || {};
-    const msg = (value.messages && value.messages[0]) || null;
+  const msg = (value.messages && value.messages[0]) || null;
+
+  // Track incoming message
+  if (msg) {
+    metrics.recordMessageReceived();
+  }
 
     // attempt userName from contacts
     const contactName =
@@ -1328,11 +1374,19 @@ app.post("/webhook", webhookRateLimit, validateWebhookRequest, asyncHandler(asyn
 
 // Health check endpoint
 app.get("/health", (req, res) => {
+  const summary = metrics.getSummary();
   res.status(200).json({
     status: "healthy",
     timestamp: new Date().toISOString(),
-    version: "1.0.0"
+    version: "1.0.0",
+    metrics: summary
   });
+});
+
+// Metrics endpoint (detailed)
+app.get("/metrics", (req, res) => {
+  const detailedMetrics = metrics.getMetrics();
+  res.status(200).json(detailedMetrics);
 });
 
 // Add error handling middleware (must be last)
@@ -1345,6 +1399,10 @@ if (require.main === module) {
     console.log(`[INFO] HRM Bot server started on port ${port}`);
     console.log(`[INFO] Environment: ${CONFIG.NODE_ENV}`);
     console.log(`[INFO] Health check: http://localhost:${port}/health`);
+    console.log(`[INFO] Metrics: http://localhost:${port}/metrics`);
+    
+    // Start metrics logging
+    startMetricsLogging();
   });
 }
 
