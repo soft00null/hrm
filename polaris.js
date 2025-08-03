@@ -261,6 +261,52 @@ then you fetch matching doctors.
       },
       required: ["userSymptom"],
     },
+  },
+  {
+    name: "leads_capture",
+    description: `
+Captures potential business leads when users show interest in services, ask about pricing, mention referrals, 
+or make general inquiries that could lead to business. Categorizes and prioritizes leads for follow-up.
+Detects lead indicators like: service inquiries, price questions, insurance coverage, facility tours, 
+corporate health programs, referrals, specialized treatments, hospital comparisons, first-time interactions.
+`,
+    parameters: {
+      type: "object",
+      properties: {
+        inquiry: { 
+          type: "string", 
+          description: "User's original inquiry or interest" 
+        },
+        leadCategory: { 
+          type: "string", 
+          enum: ["Patient Inquiry", "Referral", "Corporate", "Partnership", "Insurance", "Specialty Service", "Emergency Consult"],
+          description: "Category of the lead based on inquiry type"
+        },
+        interestedServices: { 
+          type: "array", 
+          items: { type: "string" },
+          description: "Services the user showed interest in"
+        },
+        priority: { 
+          type: "string", 
+          enum: ["High", "Medium", "Low"],
+          description: "Lead priority based on urgency and potential value"
+        },
+        referredBy: { 
+          type: "string", 
+          description: "Who referred this person, if mentioned" 
+        },
+        budget: {
+          type: "string",
+          description: "Estimated budget or cost mentioned by user"
+        },
+        timeline: {
+          type: "string", 
+          description: "When they need the service (urgent, this week, next month, etc.)"
+        }
+      },
+      required: ["inquiry", "leadCategory", "priority"]
+    }
   }
 ];
 
@@ -1127,6 +1173,219 @@ If it feels severe, please see a physician immediately.`;
   return finalCombined;
 }
 
+// ----------------------------------------------------------------------
+// Leads Management System
+// ----------------------------------------------------------------------
+
+/**
+ * Calculate lead score based on various factors
+ */
+function calculateLeadScore(args, userQuery) {
+  let score = 0.5; // Base score
+
+  // Urgency keywords increase score
+  const urgencyKeywords = ['urgent', 'immediate', 'emergency', 'asap', 'quickly', 'soon', 'today', 'this week'];
+  const urgencyFound = urgencyKeywords.some(keyword => 
+    userQuery.toLowerCase().includes(keyword) || 
+    (args.timeline && args.timeline.toLowerCase().includes(keyword))
+  );
+  if (urgencyFound) score += 0.3;
+
+  // Budget indicators increase score
+  const budgetKeywords = ['insurance', 'cost', 'price', 'affordable', 'premium', 'package', 'payment'];
+  const budgetFound = budgetKeywords.some(keyword => 
+    userQuery.toLowerCase().includes(keyword) || 
+    (args.budget && args.budget.length > 0)
+  );
+  if (budgetFound) score += 0.2;
+
+  // Referral sources increase score significantly
+  if (args.referredBy && args.referredBy.length > 0) score += 0.4;
+  if (args.leadCategory === "Referral") score += 0.3;
+
+  // Service complexity affects score
+  const specialtyServices = ['surgery', 'specialist', 'consultation', 'procedure', 'treatment'];
+  const specialtyFound = specialtyServices.some(keyword => 
+    userQuery.toLowerCase().includes(keyword) || 
+    (args.interestedServices && args.interestedServices.some(service => 
+      service.toLowerCase().includes(keyword)))
+  );
+  if (specialtyFound) score += 0.2;
+
+  // Corporate and partnership leads are high value
+  if (args.leadCategory === "Corporate" || args.leadCategory === "Partnership") score += 0.3;
+
+  // Emergency consults are immediate high priority
+  if (args.leadCategory === "Emergency Consult") score += 0.4;
+
+  // Engagement level - multiple questions or detailed inquiry
+  if (userQuery.length > 100) score += 0.1;
+  if (args.interestedServices && args.interestedServices.length > 1) score += 0.1;
+
+  // Ensure score stays within 0-1 range
+  return Math.min(1.0, Math.max(0.1, score));
+}
+
+/**
+ * Generate lead response based on category
+ */
+function generateLeadResponse(args) {
+  const category = args.leadCategory;
+  const responses = {
+    "Patient Inquiry": `Thank you for your interest in our ${args.interestedServices ? args.interestedServices.join(' and ') : 'services'}! I'd be happy to help you with detailed information. Let me connect you with our patient coordinator who can provide you with specific details about costs, timing, and next steps. 📋✨`,
+    
+    "Referral": `Thank you for the referral${args.referredBy ? ` from ${args.referredBy}` : ''}! We truly appreciate the trust. I'll make sure you receive priority attention and our special referral benefits. Let me get you connected with our VIP patient services. 🌟`,
+    
+    "Corporate": `Thank you for considering us for your corporate health program! This sounds like a great opportunity. I'll connect you with our corporate partnerships team who can provide customized solutions for your organization. 🏢💼`,
+    
+    "Partnership": `Thank you for your interest in partnering with us! I'll connect you with our partnerships team who can discuss collaboration opportunities that would benefit both our organizations. 🤝`,
+    
+    "Insurance": `I understand you have questions about insurance coverage. Let me connect you with our insurance coordination team who can help verify your coverage and explain your benefits for the services you need. 💳`,
+    
+    "Specialty Service": `Thank you for your interest in our specialized services. I'll connect you with our specialist coordinators who can provide detailed information about the specific treatments and procedures you're inquiring about. ⚕️`,
+    
+    "Emergency Consult": `I understand this is urgent. For immediate emergencies, please call our emergency line or visit our emergency department directly. I'm also connecting you with our emergency consultation team for priority scheduling. 🚨`
+  };
+
+  let response = responses[category] || responses["Patient Inquiry"];
+  
+  // Add timeline acknowledgment if provided
+  if (args.timeline) {
+    response += ` I've noted that you need this ${args.timeline}, and we'll prioritize accordingly.`;
+  }
+
+  return response;
+}
+
+/**
+ * Create a lead record in Firestore
+ */
+async function createLeadRecord(pocRef, args, fromPhone, userQuery, orgId) {
+  console.log(`[INFO] createLeadRecord => orgId=${orgId} at ${formatISTTimestamp()}`);
+  
+  const orgRef = await getOrganisationRef(orgId);
+  if (!orgRef) {
+    console.log(`[WARN] no Org doc for ${orgId} => cannot create lead`);
+    return null;
+  }
+
+  // Generate lead ID
+  const leadId = "LEAD-" + generateId(8);
+  
+  // Calculate conversion probability score
+  const conversionProbability = calculateLeadScore(args, userQuery);
+  
+  // Create lead document
+  const leadDoc = {
+    LeadID: leadId,
+    PoCRef: pocRef,
+    userPhone: fromPhone,
+    leadSource: "WhatsApp Chat",
+    leadCategory: args.leadCategory,
+    priority: args.priority,
+    status: "New",
+    
+    // Lead Details
+    inquiry: args.inquiry,
+    interestedServices: args.interestedServices || [],
+    budget: args.budget || "",
+    timeline: args.timeline || "",
+    
+    // Tracking Information
+    createdAt: getCurrentIndianTime(),
+    lastContactedAt: getCurrentIndianTime(),
+    conversionProbability: conversionProbability,
+    
+    // Source Attribution
+    referredBy: args.referredBy || "",
+    marketingChannel: "Organic", // Default for WhatsApp
+    
+    // Interaction History
+    interactions: [{
+      type: "Chat",
+      timestamp: getCurrentIndianTime(),
+      summary: args.inquiry.length > 100 ? args.inquiry.substring(0, 100) + "..." : args.inquiry,
+      outcome: "Initial Contact"
+    }],
+    
+    // Organization Context
+    OrgID: orgId,
+    tags: []
+  };
+
+  // Add urgency tag if high priority
+  if (args.priority === "High") {
+    leadDoc.tags.push("Urgent");
+  }
+  
+  // Add referral tag if applicable
+  if (args.leadCategory === "Referral") {
+    leadDoc.tags.push("Referral");
+  }
+
+  try {
+    const leadRef = orgRef.collection("Leads").doc(leadId);
+    await leadRef.set(leadDoc);
+    console.log(`[INFO] Created Lead => /Organisation/${orgId}/Leads/${leadId} at ${formatISTTimestamp()}`);
+
+    // Create notification for new lead
+    const pocSnap = await pocRef.get();
+    const pocData = pocSnap.exists ? pocSnap.data() : {};
+    const userName = pocData.Name || "User";
+    
+    const priorityEmoji = args.priority === "High" ? "🔥" : args.priority === "Medium" ? "⚡" : "📋";
+    const notificationMessage = `${priorityEmoji} New ${args.priority.toLowerCase()} priority ${args.leadCategory.toLowerCase()} lead from ${userName}: "${args.inquiry.length > 50 ? args.inquiry.substring(0, 50) + '...' : args.inquiry}"`;
+    
+    await createNotification(orgRef, fromPhone, notificationMessage, "Lead", {
+      PoCRef: pocRef,
+      leadRef: leadRef,
+      leadDetails: {
+        category: args.leadCategory,
+        priority: args.priority,
+        conversionProbability: conversionProbability,
+        interestedServices: args.interestedServices,
+        referredBy: args.referredBy
+      }
+    });
+
+    return leadRef;
+  } catch (err) {
+    console.error(`[ERROR] Failed to create lead record: ${err}`);
+    return null;
+  }
+}
+
+/**
+ * Main leads capture implementation
+ */
+async function leadsCapturelImpl(args, fromPhone, userId, orgId) {
+  console.log(`[INFO] leadsCapture => args=${JSON.stringify(args)}, orgId=${orgId} at ${formatISTTimestamp()}`);
+  
+  try {
+    // Get PoC reference
+    const pocRef = await db.collection("PoC").doc(userId);
+    
+    // Create lead record
+    const leadRef = await createLeadRecord(pocRef, args, fromPhone, args.inquiry, orgId);
+    
+    if (!leadRef) {
+      return "Thank you for your inquiry! We've received your information and someone from our team will contact you soon.";
+    }
+
+    // Generate appropriate response based on lead category
+    const response = generateLeadResponse(args);
+    
+    // Log lead capture
+    console.log(`[INFO] Lead captured => ID=${leadRef.id}, Category=${args.leadCategory}, Priority=${args.priority} at ${formatISTTimestamp()}`);
+    
+    return response;
+    
+  } catch (err) {
+    console.error(`[ERROR] leadsCapturelImpl => ${err}`);
+    return "Thank you for your inquiry! We've received your information and someone from our team will contact you soon.";
+  }
+}
+
 /**
  * We have a fixed list of possible specialties:
  *   [General Physician, Neurologist, Cardiologist, Orthopedic Surgeon, 
@@ -1408,6 +1667,10 @@ async function handleLocalFunctionCall(name, args, fromPhone, userId, userQuery,
       // now an async function => must await
       return await symptomAssessmentImpl(args.userSymptom || "", orgId);
 
+    case "leads_capture":
+      // handle lead capture => create lead record and return response
+      return await leadsCapturelImpl(args, fromPhone, userId, orgId);
+
     default:
       return "Kindly only ask anything related to Polaris Hospital.";
   }
@@ -1462,12 +1725,40 @@ async function sendWhatsAppMessage(to, message) {
 const systemMessage = {
   role: "system",
   content: `
-You are Polaris Hospital's Chatbot in English. 
-We've replaced the old knowledge lookup with substring search + 
-a fallback GPT pass over the entire knowledge base if no substring found. 
-We also use GPT for symptom classification. 
-No other flows changed. 
-Respond in a natural, friendly, and helpful manner.
+You are Polaris Hospital's Chatbot in English with intelligent lead detection capabilities.
+
+Core Functions:
+- Knowledge lookup with substring search + GPT fallback over knowledge base
+- GPT-powered symptom classification and doctor recommendations  
+- Appointment booking and support ticket creation
+- LEAD DETECTION: Identify potential business opportunities and capture leads
+
+LEAD DETECTION GUIDELINES:
+Detect lead opportunities when users:
+- Ask about service costs, pricing, or insurance coverage
+- Show interest in specific treatments or procedures  
+- Mention referrals from doctors, patients, or partners
+- Inquire about corporate health programs or partnerships
+- Ask for facility tours or general hospital information
+- Compare services with other hospitals
+- Express urgency or immediate needs
+- Are first-time users asking general questions
+
+LEAD CATEGORIES:
+- Patient Inquiry: General healthcare questions, service interest
+- Referral: Mentioned by existing patients/doctors/partners  
+- Corporate: Company health programs, employee screening
+- Partnership: Medical collaborations, joint programs
+- Insurance: Coverage questions, TPA inquiries
+- Specialty Service: Specialized treatments, procedures
+- Emergency Consult: Urgent medical consultations
+
+LEAD PRIORITY:
+- High: Urgent needs, referrals, corporate inquiries, immediate decisions
+- Medium: Specific service interest, planned procedures, budget mentioned
+- Low: General inquiries, information gathering, future considerations
+
+Always respond naturally and helpfully while capturing valuable lead information for business development.
 `,
 };
 
@@ -2192,6 +2483,313 @@ app.get("/notification-counts", async (req, res) => {
     });
   } catch (e) {
     console.error(`[ERROR] notification-counts failed => ${e} at ${formatISTTimestamp()}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ----------------------------------------------------------------------
+// Lead Analytics and Management Endpoints
+// ----------------------------------------------------------------------
+
+// Get leads for an organization with filtering options
+app.get("/leads", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+    const orgId = req.query.orgId || "Polaris";
+    const limit = parseInt(req.query.limit || "50", 10);
+    const category = req.query.category || null;
+    const priority = req.query.priority || null;
+    const status = req.query.status || null;
+    
+    // Only run with proper authorization
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    
+    const orgRef = await getOrganisationRef(orgId);
+    if (!orgRef) {
+      return res.status(404).json({ error: `Organization ${orgId} not found` });
+    }
+    
+    // Build the query with filters
+    let leadsQuery = orgRef.collection("Leads").orderBy("createdAt", "desc");
+    
+    // Add filters if specified
+    if (category) {
+      leadsQuery = leadsQuery.where("leadCategory", "==", category);
+    }
+    if (priority) {
+      leadsQuery = leadsQuery.where("priority", "==", priority);
+    }
+    if (status) {
+      leadsQuery = leadsQuery.where("status", "==", status);
+    }
+    
+    // Apply limit
+    leadsQuery = leadsQuery.limit(limit);
+    
+    const leadsSnap = await leadsQuery.get();
+    
+    // Format leads for response
+    const leads = leadsSnap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        ...data,
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null,
+        lastContactedAt: data.lastContactedAt ? data.lastContactedAt.toDate().toISOString() : null,
+        expectedFollowUpDate: data.expectedFollowUpDate ? data.expectedFollowUpDate.toDate().toISOString() : null
+      };
+    });
+    
+    return res.status(200).json({
+      success: true,
+      count: leads.length,
+      leads,
+      timestamp: formatISTTimestamp()
+    });
+  } catch (e) {
+    console.error(`[ERROR] get-leads failed => ${e} at ${formatISTTimestamp()}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Get lead analytics and statistics
+app.get("/leads/analytics", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+    const orgId = req.query.orgId || "Polaris";
+    
+    // Only run with proper authorization
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    
+    const orgRef = await getOrganisationRef(orgId);
+    if (!orgRef) {
+      return res.status(404).json({ error: `Organization ${orgId} not found` });
+    }
+    
+    // Get all leads
+    const leadsSnap = await orgRef.collection("Leads").get();
+    
+    // Calculate analytics
+    const analytics = {
+      total: leadsSnap.size,
+      byCategory: {},
+      byPriority: {},
+      byStatus: {},
+      conversionStats: {
+        averageScore: 0,
+        highValueLeads: 0, // score > 0.7
+        mediumValueLeads: 0, // score 0.4-0.7
+        lowValueLeads: 0 // score < 0.4
+      },
+      sourceAttribution: {},
+      timelineStats: {},
+      recentActivity: {
+        thisWeek: 0,
+        thisMonth: 0,
+        last30Days: 0
+      }
+    };
+    
+    let totalScore = 0;
+    const now = new Date();
+    const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const oneMonthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    
+    leadsSnap.docs.forEach(doc => {
+      const data = doc.data();
+      
+      // Category stats
+      analytics.byCategory[data.leadCategory] = (analytics.byCategory[data.leadCategory] || 0) + 1;
+      
+      // Priority stats
+      analytics.byPriority[data.priority] = (analytics.byPriority[data.priority] || 0) + 1;
+      
+      // Status stats
+      analytics.byStatus[data.status] = (analytics.byStatus[data.status] || 0) + 1;
+      
+      // Conversion probability stats
+      const score = data.conversionProbability || 0;
+      totalScore += score;
+      
+      if (score > 0.7) analytics.conversionStats.highValueLeads++;
+      else if (score >= 0.4) analytics.conversionStats.mediumValueLeads++;
+      else analytics.conversionStats.lowValueLeads++;
+      
+      // Source attribution
+      analytics.sourceAttribution[data.leadSource] = (analytics.sourceAttribution[data.leadSource] || 0) + 1;
+      
+      // Timeline stats
+      if (data.timeline) {
+        analytics.timelineStats[data.timeline] = (analytics.timelineStats[data.timeline] || 0) + 1;
+      }
+      
+      // Recent activity
+      if (data.createdAt) {
+        const createdDate = data.createdAt.toDate();
+        if (createdDate > oneWeekAgo) analytics.recentActivity.thisWeek++;
+        if (createdDate > oneMonthAgo) {
+          analytics.recentActivity.thisMonth++;
+          analytics.recentActivity.last30Days++;
+        }
+      }
+    });
+    
+    analytics.conversionStats.averageScore = analytics.total > 0 ? totalScore / analytics.total : 0;
+    
+    return res.status(200).json({
+      success: true,
+      analytics,
+      timestamp: formatISTTimestamp()
+    });
+  } catch (e) {
+    console.error(`[ERROR] leads-analytics failed => ${e} at ${formatISTTimestamp()}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Update lead status
+app.post("/leads/update-status", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+    const orgId = req.query.orgId || "Polaris";
+    const leadId = req.body.leadId;
+    const newStatus = req.body.status;
+    const notes = req.body.notes || "";
+    
+    // Only run with proper authorization
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    
+    if (!leadId || !newStatus) {
+      return res.status(400).json({ error: "Lead ID and status are required" });
+    }
+    
+    const validStatuses = ["New", "Contacted", "Qualified", "Converted", "Lost"];
+    if (!validStatuses.includes(newStatus)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+    
+    const orgRef = await getOrganisationRef(orgId);
+    if (!orgRef) {
+      return res.status(404).json({ error: `Organization ${orgId} not found` });
+    }
+    
+    const leadRef = orgRef.collection("Leads").doc(leadId);
+    const leadDoc = await leadRef.get();
+    
+    if (!leadDoc.exists) {
+      return res.status(404).json({ error: "Lead not found" });
+    }
+    
+    // Update the lead
+    const updateData = {
+      status: newStatus,
+      lastContactedAt: getCurrentIndianTime()
+    };
+    
+    // Add interaction to history
+    const currentData = leadDoc.data();
+    const interactions = currentData.interactions || [];
+    interactions.push({
+      type: "Status Update",
+      timestamp: getCurrentIndianTime(),
+      summary: `Status changed to ${newStatus}${notes ? ': ' + notes : ''}`,
+      outcome: newStatus
+    });
+    updateData.interactions = interactions;
+    
+    await leadRef.update(updateData);
+    
+    return res.status(200).json({
+      success: true,
+      message: `Lead status updated to ${newStatus}`,
+      timestamp: formatISTTimestamp()
+    });
+  } catch (e) {
+    console.error(`[ERROR] update-lead-status failed => ${e} at ${formatISTTimestamp()}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Get lead conversion pipeline
+app.get("/leads/pipeline", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+    const orgId = req.query.orgId || "Polaris";
+    
+    // Only run with proper authorization
+    if (secret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    
+    const orgRef = await getOrganisationRef(orgId);
+    if (!orgRef) {
+      return res.status(404).json({ error: `Organization ${orgId} not found` });
+    }
+    
+    // Get leads grouped by status
+    const leadsSnap = await orgRef.collection("Leads").orderBy("conversionProbability", "desc").get();
+    
+    const pipeline = {
+      New: [],
+      Contacted: [],
+      Qualified: [],
+      Converted: [],
+      Lost: []
+    };
+    
+    let totalPipelineValue = 0;
+    
+    leadsSnap.docs.forEach(doc => {
+      const data = doc.data();
+      const leadSummary = {
+        id: doc.id,
+        LeadID: data.LeadID,
+        userPhone: data.userPhone,
+        leadCategory: data.leadCategory,
+        priority: data.priority,
+        conversionProbability: data.conversionProbability || 0,
+        interestedServices: data.interestedServices || [],
+        timeline: data.timeline,
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null
+      };
+      
+      if (pipeline[data.status]) {
+        pipeline[data.status].push(leadSummary);
+      }
+      
+      // Calculate potential pipeline value (simplified)
+      if (data.status !== "Lost" && data.status !== "Converted") {
+        totalPipelineValue += data.conversionProbability || 0;
+      }
+    });
+    
+    const pipelineStats = {
+      totalLeads: leadsSnap.size,
+      totalPipelineValue: Math.round(totalPipelineValue * 100) / 100,
+      conversionRate: pipeline.Converted.length / Math.max(1, leadsSnap.size),
+      stageDistribution: {
+        New: pipeline.New.length,
+        Contacted: pipeline.Contacted.length,
+        Qualified: pipeline.Qualified.length,
+        Converted: pipeline.Converted.length,
+        Lost: pipeline.Lost.length
+      }
+    };
+    
+    return res.status(200).json({
+      success: true,
+      pipeline,
+      stats: pipelineStats,
+      timestamp: formatISTTimestamp()
+    });
+  } catch (e) {
+    console.error(`[ERROR] leads-pipeline failed => ${e} at ${formatISTTimestamp()}`);
     return res.status(500).json({ error: e.message });
   }
 });
