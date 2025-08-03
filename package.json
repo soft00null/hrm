@@ -1,0 +1,31 @@
+{
+  "name": "hrm-bot",
+  "version": "1.0.0",
+  "description": "Multi-tenant HRM WhatsApp bot for healthcare management",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.1",
+    "node-fetch": "^2.7.0",
+    "openai": "^3.3.0",
+    "@google-cloud/functions-framework": "^3.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "healthcare",
+    "bot",
+    "firebase",
+    "openai",
+    "multi-tenant"
+  ],
+  "author": "HRM Bot Team",
+  "license": "MIT"
+}
