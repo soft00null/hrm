@@ -1,29 +1,36 @@
 "use strict";
 
-
-
 const express = require("express");
 const admin = require("firebase-admin");
 const fetchFn = require("node-fetch"); // node-fetch@2
 const { Configuration, OpenAIApi } = require("openai");
 
-// ----------------------------------------------------------------------
-// Hard‑coded configuration values for Cloud Run deployment
-const WHATSAPP_TOKEN = '';
-const WHATSAPP_PHONE_ID = '';
-const VERIFY_TOKEN = '';
-const OPENAI_API_KEY = '';
+// Configuration and constants
+const { CONFIG, logConfigStatus } = require('./config');
+const { 
+  API_CONFIG, 
+  MESSAGE_CONFIG, 
+  COLLECTIONS, 
+  MESSAGE_TYPES, 
+  CHAT_DIRECTIONS,
+  TOOL_NAMES,
+  ERROR_MESSAGES,
+  SUCCESS_MESSAGES 
+} = require('./constants');
+
+// Log configuration status on startup
+logConfigStatus();
 
 // ----------------------------------------------------------------------
 // 1) Firebase Admin
 // ----------------------------------------------------------------------
-if (!process.env.GOOGLE_CLOUD_PROJECT) {
+if (!CONFIG.GOOGLE_CLOUD_PROJECT) {
   console.log("[INFO] Possibly local => loading serviceAccountKey.json...");
   try {
     const serviceAccount = require("./serviceAccountKey.json");
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
-      storageBucket: "connectcare-hrm.firebasestorage.app" // confirm your bucket name
+      storageBucket: CONFIG.FIREBASE_STORAGE_BUCKET
     });
     console.log("[INFO] Firebase Admin local init success.");
   } catch (err) {
@@ -33,7 +40,7 @@ if (!process.env.GOOGLE_CLOUD_PROJECT) {
 } else {
   console.log("[INFO] Using default credentials for Firebase Admin...");
   admin.initializeApp({
-    storageBucket: "connectcare-hrm.firebasestorage.app"
+    storageBucket: CONFIG.FIREBASE_STORAGE_BUCKET
   });
 }
 const db = admin.firestore();
@@ -43,7 +50,7 @@ console.log("[INFO] Firestore + Storage ready.");
 // ----------------------------------------------------------------------
 // 2) OpenAI GPT-4o mini
 // ----------------------------------------------------------------------
-const openAiConfig = new Configuration({ apiKey: OPENAI_API_KEY });
+const openAiConfig = new Configuration({ apiKey: CONFIG.OPENAI_API_KEY });
 const openai = new OpenAIApi(openAiConfig);
 console.log("[INFO] OpenAI createChatCompletion configured.");
 
@@ -51,13 +58,11 @@ console.log("[INFO] OpenAI createChatCompletion configured.");
 // 3) Knowledge base from external link
 // ----------------------------------------------------------------------
 let knowledgeText = "No knowledgebase loaded.";
-const knowledgeUrl =
-  "https://Testhospital.in/";
 
 (async function fetchKnowledgeBase() {
   try {
-    console.log(`[INFO] Fetching knowledge from: ${knowledgeUrl}`);
-    const resp = await fetchFn(knowledgeUrl);
+    console.log(`[INFO] Fetching knowledge from: ${CONFIG.KNOWLEDGE_BASE_URL}`);
+    const resp = await fetchFn(CONFIG.KNOWLEDGE_BASE_URL);
     const text = await resp.text();
     knowledgeText = text;
     console.log(`[INFO] knowledge fetched => length=${knowledgeText.length}`);
@@ -70,7 +75,7 @@ const knowledgeUrl =
 // ----------------------------------------------------------------------
 // Utility: random ID, random flow token
 // ----------------------------------------------------------------------
-function generateId(length = 8) {
+function generateId(length = MESSAGE_CONFIG.ID_LENGTH) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let result = "";
   for (let i = 0; i < length; i++) {
@@ -79,7 +84,7 @@ function generateId(length = 8) {
   return result;
 }
 
-function generateFlowToken(length = 6) {
+function generateFlowToken(length = MESSAGE_CONFIG.FLOW_TOKEN_LENGTH) {
   const digits = "0123456789";
   let r = "";
   for (let i = 0; i < length; i++) {
@@ -168,7 +173,7 @@ then you fetch matching doctors.
 // ----------------------------------------------------------------------
 async function getTestOrganisationRef() {
   const orgSnap = await db
-    .collection("Organisation")
+    .collection(COLLECTIONS.ORGANIZATIONS)
     .where("OrgID", "==", "Test")
     .limit(1)
     .get();
@@ -187,7 +192,7 @@ async function getTestOrganisationRef() {
 async function getOrCreatePoCByPhone(phone, contactName) {
   console.log(`[INFO] getOrCreatePoCByPhone => phone=${phone}`);
   let snap = await db
-    .collection("PoC")
+    .collection(COLLECTIONS.POC)
     .where("Phone", "==", phone)
     .limit(1)
     .get();
@@ -200,7 +205,7 @@ async function getOrCreatePoCByPhone(phone, contactName) {
 
   // Not found => create new PoC
   let safeName = contactName;
-  let newDoc = await db.collection("PoC").add({
+  let newDoc = await db.collection(COLLECTIONS.POC).add({
     Name: safeName,
     Phone: phone,
     BotMode: true,
@@ -215,7 +220,7 @@ async function getOrCreatePoCByPhone(phone, contactName) {
   }
 
   // Create the initial patient doc for the new PoC
-  await newDoc.collection("Patients").add({
+  await newDoc.collection(COLLECTIONS.PATIENTS).add({
     Name: safeName,
     Gender: "NA",
     Age: 0,
@@ -229,7 +234,9 @@ async function getOrCreatePoCByPhone(phone, contactName) {
 
 async function saveChatToPoC(pocRef, direction, from, to, msgType, msgBody, extraFields = {}) {
   let truncated = msgBody || "";
-  if (truncated.length > 300) truncated = truncated.slice(0, 300) + "...(truncated)";
+  if (truncated.length > MESSAGE_CONFIG.TRUNCATED_MESSAGE_LENGTH) {
+    truncated = truncated.slice(0, MESSAGE_CONFIG.TRUNCATED_MESSAGE_LENGTH) + "...(truncated)";
+  }
 
   let data = {
     Direction: direction,
@@ -240,7 +247,7 @@ async function saveChatToPoC(pocRef, direction, from, to, msgType, msgBody, extr
     Timestamp: admin.firestore.FieldValue.serverTimestamp(),
     ...extraFields,
   };
-  await pocRef.collection("Chat").add(data);
+  await pocRef.collection(COLLECTIONS.CHAT).add(data);
   console.log(
     `[INFO] Chat => direction=${direction}, from=${from}, to=${to}, msgType=${msgType}`
   );
@@ -251,8 +258,8 @@ async function saveChatToPoC(pocRef, direction, from, to, msgType, msgBody, extr
 // ----------------------------------------------------------------------
 async function downloadWhatsAppMediaAndUpload(mediaId, mimeType = "application/octet-stream") {
   try {
-    const token = WHATSAPP_TOKEN;
-    let metaUrl = `https://graph.facebook.com/v17.0/${mediaId}`;
+    const token = CONFIG.WHATSAPP_TOKEN;
+    let metaUrl = `${API_CONFIG.WHATSAPP_BASE_URL}/${API_CONFIG.WHATSAPP_API_VERSION}/${mediaId}`;
     let metaResp = await fetchFn(metaUrl, {
       method: "GET",
       headers: { Authorization: `Bearer ${token}` },
@@ -306,11 +313,11 @@ async function downloadWhatsAppMediaAndUpload(mediaId, mimeType = "application/o
 // ----------------------------------------------------------------------
 async function sendAppointmentFlow(userPhone) {
   console.log(`[INFO] sendAppointmentFlow => phone=${userPhone}`);
-  const phoneId = WHATSAPP_PHONE_ID;
-  const token = WHATSAPP_TOKEN;
-  const url = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
+  const phoneId = CONFIG.WHATSAPP_PHONE_ID;
+  const token = CONFIG.WHATSAPP_TOKEN;
+  const url = `${API_CONFIG.WHATSAPP_BASE_URL}/${API_CONFIG.WHATSAPP_API_VERSION}/${phoneId}/messages`;
 
-  const flowTok = generateFlowToken(6);
+  const flowTok = generateFlowToken();
 
   let payload = {
     messaging_product: "whatsapp",
@@ -465,9 +472,9 @@ async function createAppointmentDoc(pocRef, userPhone, flowData) {
 // ----------------------------------------------------------------------
 async function sendSupportTemplate(userPhone) {
   console.log(`[INFO] sendSupportTemplate => phone=${userPhone}`);
-  const phoneId = WHATSAPP_PHONE_ID;
-  const token = WHATSAPP_TOKEN;
-  const url = `https://graph.facebook.com/v21.0/${phoneId}/messages`;
+  const phoneId = CONFIG.WHATSAPP_PHONE_ID;
+  const token = CONFIG.WHATSAPP_TOKEN;
+  const url = `${API_CONFIG.WHATSAPP_BASE_URL}/${API_CONFIG.WHATSAPP_API_VERSION}/${phoneId}/messages`;
 
   let payload = {
     messaging_product: "whatsapp",
@@ -987,9 +994,9 @@ async function handleOpenAiFunctionCall(fCall, fromPhone, userId, userQuery) {
 // ----------------------------------------------------------------------
 async function sendWhatsAppMessage(to, message) {
   console.log(`[INFO] sendWhatsAppMessage => to=${to}, msg="${message}"`);
-  const token = WHATSAPP_TOKEN;
-  const phoneId = WHATSAPP_PHONE_ID;
-  const url = `https://graph.facebook.com/v17.0/${phoneId}/messages`;
+  const token = CONFIG.WHATSAPP_TOKEN;
+  const phoneId = CONFIG.WHATSAPP_PHONE_ID;
+  const url = `${API_CONFIG.WHATSAPP_BASE_URL}/${API_CONFIG.WHATSAPP_API_VERSION}/${phoneId}/messages`;
 
   let payload = {
     messaging_product: "whatsapp",
@@ -1029,14 +1036,23 @@ Respond in a natural, friendly, and helpful manner.
 `,
 };
 
+// Import middleware
+const { validateWebhookRequest, sanitizeRequest } = require('./validation');
+const { errorHandler, asyncHandler } = require('./errorHandler');
+const { generalRateLimit, webhookRateLimit } = require('./rateLimit');
+
 // ----------------------------------------------------------------------
 // 11) Express + Webhook
 // ----------------------------------------------------------------------
 const app = express();
-app.use(express.json());
+
+// Apply middleware in order
+app.use(express.json({ limit: '10mb' })); // Increase limit for media messages
+app.use(sanitizeRequest); // Sanitize inputs
+app.use(generalRateLimit); // Apply general rate limiting
 
 app.get("/webhook", (req, res) => {
-  const verifyToken = VERIFY_TOKEN;
+  const verifyToken = CONFIG.VERIFY_TOKEN;
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
@@ -1051,14 +1067,13 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(400);
 });
 
-app.post("/webhook", async (req, res) => {
-  try {
-    console.log("[INFO] POST /webhook => incoming");
-    if (!req.body.object) return res.sendStatus(404);
+app.post("/webhook", webhookRateLimit, validateWebhookRequest, asyncHandler(async (req, res) => {
+  console.log("[INFO] POST /webhook => incoming");
+  if (!req.body.object) return res.sendStatus(404);
 
-    const entry = (req.body.entry && req.body.entry[0]) || {};
-    const changes = (entry.changes && entry.changes[0]) || {};
-    const value = changes.value || {};
+  const entry = (req.body.entry && req.body.entry[0]) || {};
+  const changes = (entry.changes && entry.changes[0]) || {};
+  const value = changes.value || {};
     const msg = (value.messages && value.messages[0]) || null;
 
     // attempt userName from contacts
@@ -1297,10 +1312,10 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppMessage(from, finalReply);
         await saveChatToPoC(
           pocRef,
-          "outbound",
-          WHATSAPP_PHONE_ID,
+          CHAT_DIRECTIONS.OUTBOUND,
+          CONFIG.WHATSAPP_PHONE_ID,
           from,
-          "text",
+          MESSAGE_TYPES.TEXT,
           finalReply
         );
 
@@ -1309,16 +1324,31 @@ app.post("/webhook", async (req, res) => {
     }
 
     return res.sendStatus(200);
-  } catch (e) {
-    console.error("[ERROR] =>", e);
-    return res.status(500).json({ error: e.message });
-  }
+  }));
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    version: "1.0.0"
+  });
 });
 
+// Add error handling middleware (must be last)
+app.use(errorHandler);
+
+// Local server startup (for development)
+if (require.main === module) {
+  const port = CONFIG.PORT;
+  app.listen(port, () => {
+    console.log(`[INFO] HRM Bot server started on port ${port}`);
+    console.log(`[INFO] Environment: ${CONFIG.NODE_ENV}`);
+    console.log(`[INFO] Health check: http://localhost:${port}/health`);
+  });
+}
 
 // Export Express app as Cloud Function entry point
-
-// Cloud Functions entry point registration using @google-cloud/functions-framework
 const functions = require('@google-cloud/functions-framework');
 
 // Register the Express app as an HTTP Cloud Function called "webhook"
